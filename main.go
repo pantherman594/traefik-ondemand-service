@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strconv"
 	"time"
+	"strings"
+	"sync/atomic"
 
 	"github.com/docker/docker/api/types/swarm"
 
@@ -37,7 +39,7 @@ const (
 type Service struct {
 	name      string
 	timeout   uint64
-	time      chan uint64
+	timeout_i uint32
 	isHandled bool
 }
 
@@ -55,17 +57,31 @@ func handleRequests() func(w http.ResponseWriter, r *http.Request) {
 		log.Fatal(fmt.Errorf("%+v", "Could not connect to docker API"))
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		serviceName, serviceTimeout, err := parseParams(r)
+		serviceNames, serviceTimeout, err := parseParams(r)
 		if err != nil {
 			fmt.Fprintf(w, "%+v", err)
 		}
-		service := GetOrCreateService(serviceName, serviceTimeout)
-		status, err := service.HandleServiceState(cli)
-		if err != nil {
-			fmt.Printf("Error: %+v\n ", err)
-			fmt.Fprintf(w, "%+v", err)
-		}
-		fmt.Fprintf(w, "%+s", status)
+		services := GetOrCreateServices(serviceNames, serviceTimeout)
+
+    started := true
+    for _, service := range services {
+      status, err := service.HandleServiceState(cli)
+      if err != nil {
+        fmt.Printf("Error: %+v\n ", err)
+        fmt.Fprintf(w, "%+v", err)
+        return
+      }
+
+      if status == "starting" {
+        started = false
+      }
+    }
+
+    if started {
+      fmt.Fprintf(w, "%+s", "started")
+    } else {
+      fmt.Fprintf(w, "%+s", "starting")
+    }
 	}
 }
 
@@ -76,34 +92,41 @@ func getParam(queryParams url.Values, paramName string) (string, error) {
 	return queryParams[paramName][0], nil
 }
 
-func parseParams(r *http.Request) (string, uint64, error) {
+func parseParams(r *http.Request) ([]string, uint64, error) {
 	queryParams := r.URL.Query()
 
-	serviceName, err := getParam(queryParams, "name")
+	serviceNames, err := getParam(queryParams, "names")
 	if err != nil {
-		return "", 0, nil
+		return []string{}, 0, nil
 	}
 
 	timeoutString, err := getParam(queryParams, "timeout")
 	if err != nil {
-		return "", 0, nil
+		return []string{}, 0, nil
 	}
 	serviceTimeout, err := strconv.Atoi(timeoutString)
 	if err != nil {
-		return "", 0, fmt.Errorf("timeout should be an integer")
+		return []string{}, 0, fmt.Errorf("timeout should be an integer")
 	}
-	return serviceName, uint64(serviceTimeout), nil
+	return strings.Split(serviceNames, ","), uint64(serviceTimeout), nil
 }
 
 // GetOrCreateService return an existing service or create one
-func GetOrCreateService(name string, timeout uint64) *Service {
-	if services[name] != nil {
-		return services[name]
-	}
-	service := &Service{name, timeout, make(chan uint64), false}
+func GetOrCreateServices(names []string, timeout uint64) []*Service {
+  ret := []*Service{}
+  for _, name := range names {
+    if services[name] != nil {
+      services[name].timeout = timeout
+      ret = append(ret, services[name])
+      continue
+    }
+    service := &Service{name, timeout, 0, false}
 
-	services[name] = service
-	return service
+    services[name] = service
+    ret = append(ret, service)
+  }
+
+  return ret
 }
 
 // HandleServiceState up the service if down or set timeout for downing the service
@@ -114,13 +137,7 @@ func (service *Service) HandleServiceState(cli *client.Client) (string, error) {
 	}
 	if status == UP {
 		fmt.Printf("- Service %v is up\n", service.name)
-		if !service.isHandled {
-			go service.stopAfterTimeout(cli)
-		}
-		select {
-		case service.time <- service.timeout:
-		default:
-		}
+		go service.stopAfterTimeout(cli)
 		return "started", nil
 	} else if status == STARTING {
 		fmt.Printf("- Service %v is starting\n", service.name)
@@ -161,24 +178,16 @@ func (service *Service) start(client *client.Client) {
 	service.isHandled = true
 	service.setServiceReplicas(client, 1)
 	go service.stopAfterTimeout(client)
-	service.time <- service.timeout
 }
 
 func (service *Service) stopAfterTimeout(client *client.Client) {
 	service.isHandled = true
-	for {
-		select {
-		case timeout, ok := <-service.time:
-			if ok {
-				time.Sleep(time.Duration(timeout) * time.Second)
-			} else {
-				fmt.Println("That should not happen, but we never know ;)")
-			}
-		default:
-			fmt.Printf("Stopping service %s\n", service.name)
-			service.setServiceReplicas(client, 0)
-			return
-		}
+	ctr := atomic.AddUint32(&service.timeout_i, 1)
+
+	time.Sleep(time.Duration(service.timeout) * time.Second)
+	if ctr == atomic.LoadUint32(&service.timeout_i) {
+		fmt.Printf("Stopping service %s\n", service.name)
+		service.setServiceReplicas(client, 0)
 	}
 }
 
